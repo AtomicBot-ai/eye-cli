@@ -6,12 +6,13 @@
  */
 
 import { mkdir } from 'node:fs/promises'
+import { WorkspaceService, sanitizeWorkspaceData } from '../workspace-service/index.js'
 import { ClientKeys } from '../terminal-data/index.js'
 import { telemetryConsent } from '../telemetry/index.js'
 import { AtomicCore } from '@atomic-chat/core'
 import { CoreClient } from '@atomic-chat/core/client'
-import { AdminServer, ensureAdminToken, RelayHub, SessionStore } from '../admin/index.js'
-import type { AdminConfigView, AdminStatus } from '../admin/index.js'
+import { ADMIN_BUILD_ID, AdminServer, ensureAdminToken, RelayHub, SessionStore } from '../admin/index.js'
+import type { AdminConfigView, AdminStatus } from '../contract/index.js'
 import type { AtcPaths, ResolvedConfig } from '../config/index.js'
 import { FIELDS, getAt } from '../config/index.js'
 import { HttpCoreLink, InProcessEvents, removeDaemonRecord, writeDaemonRecord } from '../core-link/index.js'
@@ -27,7 +28,6 @@ import type { EnvironmentOperationView, HostServices } from '../host/index.js'
 import type { AtcIo } from '../io.js'
 import type { Logger } from '../output/index.js'
 import { ATC_BUILD_DATE, ATC_GIT_SHA, ATC_VERSION, CORE_VERSION } from '../version.js'
-import { ADMIN_BUILD_ID } from '../admin/static.js'
 
 export interface DaemonOptions {
   paths: AtcPaths
@@ -81,8 +81,6 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
     // The keyring, read on every public request: one of its keys is required, a revoked one is refused
     // at once (`[]` refuses everyone). The core's own `server.api_key` does not apply.
     publicApiKeys: () => keys.current(),
-    // Model files of 32 MiB and more come over four byte-range streams.
-    downloadStreams: 4,
     // A model check gives up reading a remote GGUF header after 20 s instead of hanging on a slow mirror.
     remoteGgufTimeoutMs: 20_000,
     ownerScope: 'cli',
@@ -122,6 +120,16 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
     log: (m) => log.debug(m),
   })
 
+  const workspace = new WorkspaceService({
+    link,
+    paths,
+    config: options.config.values,
+    fetch: io.fetch,
+    platform: host.facts.platform,
+    selfCommand: host.selfCommand,
+    // Models are downloaded here, not by the core: `HF_TOKEN` reaches gated repositories.
+    env: io.env,
+  })
   const hostSteps = new HostStepExecutor({
     hostStepsDir: paths.hostStepsDir,
     journal: new HostStepJournal(paths.hostStepsJournal),
@@ -135,7 +143,8 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
     newId: () => crypto.randomUUID(),
   })
   const offEvents = core.events.onAny((record) => {
-    relay.publish(record.name, record.payload)
+    relay.publish(record.name, sanitizeWorkspaceData(record.payload))
+    workspace.event(String(record.name), record.payload)
     if (String(record.name) === 'environment:operation') {
       void hostSteps
         .handle(record.payload as unknown as EnvironmentOperationView)
@@ -215,6 +224,7 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
       adminToken: () => ensureAdminToken(paths.adminToken),
       status,
       config: configView,
+      workspace,
       log: log.child('admin'),
     })
   }
